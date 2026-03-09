@@ -4,8 +4,9 @@ from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+# Using bind_tools directly since create_react_agent not available in this version
+from langchain_ollama import ChatOllama
 from langchain_community.tools import DuckDuckGoSearchRun
 # Note: AgentExecutor not available in this LangChain version, using manual tool calling
 from ddgs import DDGS
@@ -242,11 +243,11 @@ def _create_college_basketball_search_tool():
 def build_college_basketball_agent(
     model: str = "llama3.2:3b",
 ):
-    """Create an autonomous LangChain agent that can use web search tools.
+    """Create an autonomous LangChain agent that can use web search tools with bind_tools support.
     
     The agent will:
     - Analyze user input autonomously
-    - Decide when to use the search tool
+    - Decide when to use the search tool using bind_tools
     - Extract necessary information from queries
     - Use tools to find college basketball game information
     - Provide comprehensive answers with sources
@@ -263,209 +264,159 @@ def build_college_basketball_agent(
     print(f"[DEBUG] Current date: {current_date}")
     print(f"[DEBUG] Date range (next 7 days): {current_date} to {end_date}\n")
     
-    # Create a ReAct-style agent that can reason and use tools
-    # Since ChatOllama doesn't support bind_tools, we'll use a manual approach
+    # Create agent prompt with date context
+    prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            (
+                "You are an intelligent assistant that helps users find detailed, up-to-date "
+                "information about **college basketball games** using web search tools.\n\n"
+                f"IMPORTANT CONTEXT:\n"
+                f"- Today's date is {current_date}\n"
+                f"- When users ask about 'next 7 days', this means from {current_date} to {end_date}\n"
+                f"- Always use the actual current date when interpreting date ranges\n\n"
+                "You have access to a search tool. When a user asks about college basketball games:\n"
+                "1. Analyze their query to understand what they need (specific teams, date range, etc.)\n"
+                "2. Use the search_college_basketball_games tool to find current information\n"
+                "3. Provide a comprehensive answer based on the search results\n\n"
+                "When providing answers:\n"
+                "- For 'all games' queries, provide a COMPREHENSIVE list of ALL games across ALL teams and conferences\n"
+                "- Organize games by date and time\n"
+                "- Include dates, times, teams, TV channels (if available), and tournaments\n"
+                "- At the end of your response, include a 'Sources:' section listing all source URLs from the search results\n"
+                "- Be specific about dates and use the actual current date provided above"
+            ),
+        ),
+        MessagesPlaceholder("chat_history", optional=True),
+        ("human", "{input}"),
+        MessagesPlaceholder("agent_scratchpad"),
+    ])
     
-    def agent_call(question: str) -> str:
-        """Autonomous ReAct-style agent that reasons and uses tools."""
-        # Create a ReAct prompt that guides the agent
-        react_prompt = ChatPromptTemplate.from_messages([
-            ("system", (
-                f"You are an intelligent assistant that helps users find college basketball game information.\n\n"
-                f"Today's date is {current_date}. The next 7 days are from {current_date} to {end_date}.\n\n"
-                f"You have access to a search tool. Follow these steps:\n"
-                f"1. THOUGHT: Analyze what information you need\n"
-                f"2. If you need current information, use: ACTION: SEARCH: <search query>\n"
-                f"3. After getting search results, immediately provide: ACTION: ANSWER: <your comprehensive answer>\n\n"
-                f"IMPORTANT RULES:\n"
-                f"- Use the search tool ONCE to get current information\n"
-                f"- After receiving search results, ALWAYS provide your final answer\n"
-                f"- Do NOT search URLs or try to search multiple times\n"
-                f"- Do NOT search again after you have search results\n\n"
-                f"Available tool:\n"
-                f"- search_college_basketball_games(query): Search for college basketball games\n\n"
-                f"Your answer must include:\n"
-                f"- All relevant games organized by date\n"
-                f"- Dates, times, teams, and TV channels\n"
-                f"- A 'Sources:' section at the end with all URLs from search results\n\n"
-                f"Format:\n"
-                f"THOUGHT: <your reasoning>\n"
-                f"ACTION: SEARCH: <query> (use once)\n"
-                f"OR\n"
-                f"ACTION: ANSWER: <your comprehensive answer> (use after search)\n"
-            )),
-            ("human", "{input}"),
-        ])
+    # Bind tools to the LLM (this works with langchain-ollama ChatOllama)
+    llm_with_tools = llm.bind_tools(tools)
         
-        search_tool = tools[0]  # Get the search tool
+    def agent_call(question: str) -> str:
+        """Autonomous agent using bind_tools to call search tool."""
+        # Add date context
+        enhanced_question = (
+            f"Today's date is {current_date}. The next 7 days are from {current_date} to {end_date}. "
+            f"{question}"
+        )
+        
+        # Create messages list using the prompt template
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+        
+        # Format the prompt to get messages (provide empty scratchpad initially)
+        formatted_messages = prompt.format_messages(
+            input=enhanced_question,
+            agent_scratchpad=[],
+            chat_history=[]
+        )
+        messages = list(formatted_messages)
+        
+        # Set maximum iterations to prevent infinite loops in the agent's reasoning cycle.
+        # The agent operates in a loop: it can call tools, receive results, and decide to call
+        # more tools or provide a final answer. Without this limit, the agent could get stuck
+        # in an infinite loop if it:
+        # - Keeps trying to call tools repeatedly without making progress
+        # - Can't decide on a final answer and keeps requesting more information
+        # - Gets confused and oscillates between tool calls and responses
+        # A limit of 5 iterations is typically sufficient for most queries (1-2 tool calls + final answer)
+        # while preventing runaway execution that could consume excessive resources or time.
         max_iterations = 5
         iteration = 0
-        search_results = []
-        source_urls = []
-        
-        enhanced_question = question
         
         while iteration < max_iterations:
             iteration += 1
             print(f"\n[DEBUG] Agent iteration {iteration}")
             
-            # Get agent's reasoning and action
-            response = llm.invoke(react_prompt.format(input=enhanced_question))
-            response_text = response.content
-            print(f"[DEBUG] Agent response: {response_text[:200]}...")
+            # Get LLM response (may include tool calls)
+            response = llm_with_tools.invoke(messages)
+            messages.append(response)
             
-            # If we already have search results and agent tries to search again, force answer
-            if len(search_results) > 0 and ("ACTION: SEARCH:" in response_text or "SEARCH:" in response_text):
-                print(f"[DEBUG] Agent tried to search again, but we already have results. Forcing answer.")
-                enhanced_question = (
-                    f"Original question: {question}\n\n"
-                    f"You already have search results from {len(search_results)} search(es). "
-                    f"Please provide your final answer NOW using: ACTION: ANSWER: <your comprehensive answer>\n\n"
-                    f"Combine all search results and provide:\n"
-                    f"- All games organized by date\n"
-                    f"- Dates, times, teams, TV channels\n"
-                    f"- Sources section with all URLs\n\n"
-                    f"Latest search results:\n{search_results[-1]}"
-                )
-            # Check if agent wants to search (and we don't have results yet)
-            elif "ACTION: SEARCH:" in response_text or ("SEARCH:" in response_text and "ANSWER:" not in response_text):
-                # Extract search query
-                import re
-                search_match = re.search(r'SEARCH:\s*(.+)', response_text, re.IGNORECASE)
-                if search_match:
-                    search_query = search_match.group(1).strip()
-                    # Remove any trailing ACTION or ANSWER text
-                    search_query = re.split(r'\s+ACTION:|ANSWER:', search_query)[0].strip()
-                    
-                    # Don't search if it's a URL (agent is confused)
-                    if search_query.startswith("http://") or search_query.startswith("https://"):
-                        print(f"[DEBUG] Agent tried to search a URL, redirecting to provide answer")
-                        enhanced_question = (
-                            f"Original question: {question}\n\n"
-                            f"You have search results available. Please provide your final answer now using: "
-                            f"ANSWER: <your comprehensive answer with games, dates, times, teams, TV channels, and Sources section>"
-                        )
-                    else:
-                        print(f"[DEBUG] Agent decided to search: '{search_query}'")
-                        
-                        # Execute search
-                        try:
-                            result = search_tool.invoke({"query": search_query})
-                            search_results.append(result)
-                            print(f"[DEBUG] Search returned {len(result)} characters")
-                            
-                            # Extract URLs from result if present
-                            if "Source URLs:" in result:
-                                url_section = result.split("Source URLs:")[1]
-                                urls = re.findall(r'https?://[^\s\n]+', url_section)
-                                source_urls.extend(urls)
-                            
-                            # If we have search results, guide agent to provide answer
-                            if len(search_results) >= 1:
-                                enhanced_question = (
-                                    f"Original question: {question}\n\n"
-                                    f"Search results from {len(search_results)} search(es):\n{result}\n\n"
-                                    f"You now have search results. Please provide your final comprehensive answer using: "
-                                    f"ANSWER: <your answer>\n\n"
-                                    f"Your answer should:\n"
-                                    f"- List all relevant games organized by date\n"
-                                    f"- Include dates, times, teams, and TV channels\n"
-                                    f"- End with a 'Sources:' section listing all URLs from the search results\n"
-                                    f"- Be comprehensive and well-organized"
-                                )
-                            else:
-                                enhanced_question = (
-                                    f"Original question: {question}\n\n"
-                                    f"Search results:\n{result}\n\n"
-                                    f"Based on the search results above, provide a comprehensive answer to the original question. "
-                                    f"Include all relevant games with dates, times, teams, and TV channels. "
-                                    f"At the end, include a 'Sources:' section with all URLs from the search results."
-                                )
-                        except Exception as e:
-                            print(f"[DEBUG] Search error: {e}")
-                            enhanced_question = (
-                                f"Original question: {question}\n\n"
-                                f"Search failed with error: {e}. Please provide an answer based on your knowledge, "
-                                f"but note that the information may not be current."
-                            )
-                else:
-                    # Couldn't extract search query, ask agent to provide answer
-                    enhanced_question = (
-                        f"Original question: {question}\n\n"
-                        f"You have search results available. Please provide your final answer now using: "
-                        f"ANSWER: <your comprehensive answer>"
-                    )
-            elif "ANSWER:" in response_text or (len(search_results) > 0 and iteration >= 2) or iteration >= max_iterations:
-                # Agent is providing final answer
-                print(f"[DEBUG] Agent providing final answer")
+            # Check if LLM wants to call tools
+            if hasattr(response, 'tool_calls') and response.tool_calls and len(response.tool_calls) > 0:
+                print(f"[DEBUG] Agent decided to use tools: {len(response.tool_calls)} tool call(s)")
                 
-                # Extract answer if marked with ANSWER:
-                if "ANSWER:" in response_text:
-                    # Get everything after ANSWER:
-                    answer_parts = response_text.split("ANSWER:")
-                    if len(answer_parts) > 1:
-                        answer = answer_parts[-1].strip()
-                        # Remove any remaining ACTION or SEARCH lines
-                        lines = answer.split('\n')
-                        cleaned_lines = []
-                        for line in lines:
-                            if not line.strip().startswith("ACTION:") and not line.strip().startswith("SEARCH:"):
-                                cleaned_lines.append(line)
-                        answer = '\n'.join(cleaned_lines).strip()
-                    else:
-                        answer = response_text
-                else:
-                    # No ANSWER: marker, try to extract useful content
-                    # Remove THOUGHT and ACTION lines
-                    lines = response_text.split('\n')
-                    cleaned_lines = []
-                    skip_next = False
-                    for line in lines:
-                        if line.strip().startswith("THOUGHT:") or line.strip().startswith("ACTION:"):
-                            skip_next = True
-                            continue
-                        if skip_next and line.strip() == "":
-                            skip_next = False
-                            continue
-                        if not skip_next:
-                            cleaned_lines.append(line)
-                    answer = '\n'.join(cleaned_lines).strip()
-                    if not answer or len(answer) < 50:
-                        # Fallback: use full response
-                        answer = response_text
+                # Execute all tool calls
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("args", {})
+                    tool_id = tool_call.get("id", "")
+                    tool_query = tool_args.get("query", str(tool_args))
+                    
+                    print(f"[DEBUG] Executing tool: {tool_name}")
+                    print(f"[DEBUG] Tool query: {tool_query}")
+                    
+                    # Find and execute the tool
+                    tool_executed = False
+                    for tool in tools:
+                        if tool.name == tool_name:
+                            try:
+                                result = tool.invoke(tool_args)
+                                # Add tool result as ToolMessage
+                                messages.append(ToolMessage(
+                                    content=result,
+                                    tool_call_id=tool_id
+                                ))
+                                print(f"[DEBUG] Tool returned {len(result)} characters")
+                                tool_executed = True
+                                break
+                            except Exception as e:
+                                print(f"[DEBUG] Tool execution error: {e}")
+                                messages.append(ToolMessage(
+                                    content=f"Error: {e}",
+                                    tool_call_id=tool_id
+                                ))
+                                tool_executed = True
+                                break
+                    
+                    if not tool_executed:
+                        print(f"[DEBUG] Warning: Tool {tool_name} not found")
+                        messages.append(ToolMessage(
+                            content=f"Tool {tool_name} not found",
+                            tool_call_id=tool_id
+                        ))
+            else:
+                # No tool calls, return the final answer
+                print(f"[DEBUG] Agent completed in {iteration} iteration(s)")
+                answer = response.content
                 
                 # Ensure sources are included
-                if source_urls and "Sources:" not in answer and "Source URLs:" not in answer:
-                    unique_urls = list(set(source_urls))
-                    answer += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
-                elif not source_urls and search_results:
-                    # Try to extract URLs from search results
+                if "Sources:" not in answer and "Source URLs:" not in answer:
                     import re
-                    for result in search_results:
-                        if "Source URLs:" in result:
-                            url_section = result.split("Source URLs:")[1]
-                            urls = re.findall(r'https?://[^\s\n]+', url_section)
-                            source_urls.extend(urls)
-                    if source_urls and "Sources:" not in answer:
-                        unique_urls = list(set(source_urls))
+                    # Extract URLs from tool messages
+                    urls = []
+                    for msg in messages:
+                        if isinstance(msg, ToolMessage):
+                            msg_urls = re.findall(r'https?://[^\s\n]+', msg.content)
+                            urls.extend(msg_urls)
+                    # Also check answer
+                    answer_urls = re.findall(r'https?://[^\s\n]+', answer)
+                    urls.extend(answer_urls)
+                    
+                    if urls:
+                        unique_urls = list(set(urls))
                         answer += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
                 
                 return answer
-            else:
-                # Agent is still thinking, continue
-                enhanced_question = (
-                    f"Original question: {question}\n\n"
-                    f"Your previous response: {response_text}\n\n"
-                    f"Please decide: either use SEARCH: <query> to search for information, "
-                    f"or ANSWER: <your answer> to provide the final response."
-                )
         
-        # Max iterations reached
-        final_response = response_text if 'response_text' in locals() else "Unable to complete request."
-        if source_urls and "Sources:" not in final_response:
-            unique_urls = list(set(source_urls))
-            final_response += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
-        return final_response
+        # Max iterations reached: The agent has exceeded the maximum number of iterations.
+        # This safety mechanism prevents infinite loops. When this happens, we return the
+        # last response from the agent (if available) rather than continuing indefinitely.
+        # In practice, this should rarely occur if the agent is working correctly, but it
+        # protects against edge cases where the agent might get stuck in a reasoning loop.
+        final_answer = response.content if 'response' in locals() else "Agent reached maximum iterations."
+        
+        # Ensure sources
+        if "Sources:" not in final_answer:
+            import re
+            urls = re.findall(r'https?://[^\s\n]+', final_answer)
+            if urls:
+                unique_urls = list(set(urls))
+                final_answer += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
+        
+        return final_answer
     
     return agent_call
 
