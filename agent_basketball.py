@@ -3,10 +3,11 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.chat_models import ChatOllama
 from langchain_community.tools import DuckDuckGoSearchRun
+# Note: AgentExecutor not available in this LangChain version, using manual tool calling
 from ddgs import DDGS
 
 
@@ -43,22 +44,33 @@ def _get_llm(model: str = "llama3.2:3b") -> ChatOllama:
     return ChatOllama(model=model, temperature=0.1)
 
 
-def _make_ddg_search_fn():
-    """Return a function that searches the web for college basketball games via DuckDuckGo.
-
-    Uses LangChain's built-in DuckDuckGo search tool, which is free and requires no API key.
-    Returns both search results text and a list of source URLs.
+def _create_college_basketball_search_tool():
+    """Create a LangChain tool for searching college basketball games.
+    
+    This tool can be used by the agent autonomously to search for game information.
     """
     search_tool = DuckDuckGoSearchRun()
     ddgs = DDGS()
 
-    def search_college_basketball(query: str) -> tuple[str, list[str]]:
+    @tool
+    def search_college_basketball_games(query: str) -> str:
         """Search the web for information about college basketball games.
-
-        The query should describe:
-        - specific teams (e.g. 'Duke vs UNC')
-        - date range (e.g. 'this week', 'March 2026')
-        - type of info (scores, schedule, betting lines, TV info, etc.)
+        
+        Use this tool to find:
+        - Game schedules for specific teams or all teams
+        - Game dates, times, and TV channels
+        - Scores and results
+        - Tournament information
+        
+        Args:
+            query: Search query describing what you're looking for. Examples:
+                - "college basketball schedule next 7 days"
+                - "Duke basketball games this week"
+                - "NCAA basketball schedule"
+                - "all college basketball games"
+        
+        Returns:
+            Search results with game information and source URLs.
         """
         # Extract key terms from the query - focus on team names and dates
         import re
@@ -184,7 +196,14 @@ def _make_ddg_search_fn():
             combined = "\n\n--- Additional Search Results ---\n\n".join(all_results)
             print(f"[DEBUG] Combined search returned {len(combined)} characters")
             print(f"[DEBUG] Found {len(all_urls)} unique source URLs\n")
-            return combined, list(all_urls)
+            
+            # Format URLs for inclusion in results
+            if all_urls:
+                urls_text = "\n\nSource URLs:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(list(all_urls))])
+            else:
+                urls_text = ""
+            
+            return combined + urls_text
         elif all_results == []:
             # Fallback to single query
             try:
@@ -203,87 +222,251 @@ def _make_ddg_search_fn():
                     pass
                 
                 print(f"[DEBUG] Found {len(all_urls)} unique source URLs\n")
-                return result, list(all_urls)
+                
+                # Format URLs for inclusion in results
+                if all_urls:
+                    urls_text = "\n\nSource URLs:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(list(all_urls))])
+                else:
+                    urls_text = ""
+                
+                return result + urls_text
             except Exception as e:
                 print(f"[DEBUG] Search error: {e}\n")
-                return f"Search error: {e}", []
+                return f"Search error: {e}"
         else:
-            return "No search results found.", []
+            return "No search results found."
 
-    return search_college_basketball
+    return search_college_basketball_games
 
 
 def build_college_basketball_agent(
     model: str = "llama3.2:3b",
 ):
-    """Create a callable 'agent' that does web search + LLM reasoning.
-
-    It will:
-    - Use DuckDuckGo to search for college basketball game info.
-    - Feed the search results plus the user's question into the LLM.
+    """Create an autonomous LangChain agent that can use web search tools.
+    
+    The agent will:
+    - Analyze user input autonomously
+    - Decide when to use the search tool
+    - Extract necessary information from queries
+    - Use tools to find college basketball game information
+    - Provide comprehensive answers with sources
     """
     _init_env()
     llm = _get_llm(model=model)
-    parser = StrOutputParser()
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-                (
-                    "system",
-                    (
-                        "You are an assistant that helps users find detailed, up-to-date "
-                        "information about **college basketball games** using web search. "
-                        "Use the provided web search results as your primary source of truth. "
-                        "When asked about ALL college basketball games for a specific time period "
-                        "(like 'next 7 days'), provide a COMPREHENSIVE list of ALL games across "
-                        "ALL teams and conferences in that timeframe. Do not limit to specific teams. "
-                        "Include games from all divisions (Division I, II, III) and all conferences. "
-                        "Organize the list by date and time. Always include dates, times, teams, "
-                        "TV channels (if available), tournaments (if any), and specify how current "
-                        "the information appears to be.\n\n"
-                        "IMPORTANT: Today's date is {current_date}. When the user asks about "
-                        "'next 7 days', this means from {current_date} to {end_date}. "
-                        "Use these actual dates when organizing and presenting game information."
-                    ),
-                ),
-            (
-                "user",
-                (
-                    "User question: {question}\n\n"
-                    "Web search results:\n{web_results}\n\n"
-                    "IMPORTANT: At the end of your response, you MUST include a section titled "
-                    "'Sources:' or 'Data Sources:' that lists all the URLs provided below. "
-                    "Format each URL on a new line, numbered if there are multiple sources.\n\n"
-                    "Source URLs:\n{sources}"
-                ),
-            ),
-        ]
-    )
-
-    chain = prompt | llm | parser
-    search_fn = _make_ddg_search_fn()
-
+    
+    # Create the search tool
+    search_tool = _create_college_basketball_search_tool()
+    tools = [search_tool]
+    
+    # Get current date information
+    current_date, end_date = _get_date_range(7)
+    print(f"[DEBUG] Current date: {current_date}")
+    print(f"[DEBUG] Date range (next 7 days): {current_date} to {end_date}\n")
+    
+    # Create a ReAct-style agent that can reason and use tools
+    # Since ChatOllama doesn't support bind_tools, we'll use a manual approach
+    
     def agent_call(question: str) -> str:
-        # Get current date range for next 7 days
-        current_date, end_date = _get_date_range(7)
-        print(f"[DEBUG] Current date: {current_date}")
-        print(f"[DEBUG] Date range (next 7 days): {current_date} to {end_date}\n")
-        web_results, source_urls = search_fn(question)
+        """Autonomous ReAct-style agent that reasons and uses tools."""
+        # Create a ReAct prompt that guides the agent
+        react_prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                f"You are an intelligent assistant that helps users find college basketball game information.\n\n"
+                f"Today's date is {current_date}. The next 7 days are from {current_date} to {end_date}.\n\n"
+                f"You have access to a search tool. Follow these steps:\n"
+                f"1. THOUGHT: Analyze what information you need\n"
+                f"2. If you need current information, use: ACTION: SEARCH: <search query>\n"
+                f"3. After getting search results, immediately provide: ACTION: ANSWER: <your comprehensive answer>\n\n"
+                f"IMPORTANT RULES:\n"
+                f"- Use the search tool ONCE to get current information\n"
+                f"- After receiving search results, ALWAYS provide your final answer\n"
+                f"- Do NOT search URLs or try to search multiple times\n"
+                f"- Do NOT search again after you have search results\n\n"
+                f"Available tool:\n"
+                f"- search_college_basketball_games(query): Search for college basketball games\n\n"
+                f"Your answer must include:\n"
+                f"- All relevant games organized by date\n"
+                f"- Dates, times, teams, and TV channels\n"
+                f"- A 'Sources:' section at the end with all URLs from search results\n\n"
+                f"Format:\n"
+                f"THOUGHT: <your reasoning>\n"
+                f"ACTION: SEARCH: <query> (use once)\n"
+                f"OR\n"
+                f"ACTION: ANSWER: <your comprehensive answer> (use after search)\n"
+            )),
+            ("human", "{input}"),
+        ])
         
-        # Format source URLs for the prompt
-        if source_urls:
-            sources_text = "\n".join([f"{i+1}. {url}" for i, url in enumerate(source_urls)])
-        else:
-            sources_text = "No source URLs available."
+        search_tool = tools[0]  # Get the search tool
+        max_iterations = 5
+        iteration = 0
+        search_results = []
+        source_urls = []
         
-        return chain.invoke({
-            "question": question, 
-            "web_results": web_results,
-            "current_date": current_date,
-            "end_date": end_date,
-            "sources": sources_text
-        })
-
+        enhanced_question = question
+        
+        while iteration < max_iterations:
+            iteration += 1
+            print(f"\n[DEBUG] Agent iteration {iteration}")
+            
+            # Get agent's reasoning and action
+            response = llm.invoke(react_prompt.format(input=enhanced_question))
+            response_text = response.content
+            print(f"[DEBUG] Agent response: {response_text[:200]}...")
+            
+            # If we already have search results and agent tries to search again, force answer
+            if len(search_results) > 0 and ("ACTION: SEARCH:" in response_text or "SEARCH:" in response_text):
+                print(f"[DEBUG] Agent tried to search again, but we already have results. Forcing answer.")
+                enhanced_question = (
+                    f"Original question: {question}\n\n"
+                    f"You already have search results from {len(search_results)} search(es). "
+                    f"Please provide your final answer NOW using: ACTION: ANSWER: <your comprehensive answer>\n\n"
+                    f"Combine all search results and provide:\n"
+                    f"- All games organized by date\n"
+                    f"- Dates, times, teams, TV channels\n"
+                    f"- Sources section with all URLs\n\n"
+                    f"Latest search results:\n{search_results[-1]}"
+                )
+            # Check if agent wants to search (and we don't have results yet)
+            elif "ACTION: SEARCH:" in response_text or ("SEARCH:" in response_text and "ANSWER:" not in response_text):
+                # Extract search query
+                import re
+                search_match = re.search(r'SEARCH:\s*(.+)', response_text, re.IGNORECASE)
+                if search_match:
+                    search_query = search_match.group(1).strip()
+                    # Remove any trailing ACTION or ANSWER text
+                    search_query = re.split(r'\s+ACTION:|ANSWER:', search_query)[0].strip()
+                    
+                    # Don't search if it's a URL (agent is confused)
+                    if search_query.startswith("http://") or search_query.startswith("https://"):
+                        print(f"[DEBUG] Agent tried to search a URL, redirecting to provide answer")
+                        enhanced_question = (
+                            f"Original question: {question}\n\n"
+                            f"You have search results available. Please provide your final answer now using: "
+                            f"ANSWER: <your comprehensive answer with games, dates, times, teams, TV channels, and Sources section>"
+                        )
+                    else:
+                        print(f"[DEBUG] Agent decided to search: '{search_query}'")
+                        
+                        # Execute search
+                        try:
+                            result = search_tool.invoke({"query": search_query})
+                            search_results.append(result)
+                            print(f"[DEBUG] Search returned {len(result)} characters")
+                            
+                            # Extract URLs from result if present
+                            if "Source URLs:" in result:
+                                url_section = result.split("Source URLs:")[1]
+                                urls = re.findall(r'https?://[^\s\n]+', url_section)
+                                source_urls.extend(urls)
+                            
+                            # If we have search results, guide agent to provide answer
+                            if len(search_results) >= 1:
+                                enhanced_question = (
+                                    f"Original question: {question}\n\n"
+                                    f"Search results from {len(search_results)} search(es):\n{result}\n\n"
+                                    f"You now have search results. Please provide your final comprehensive answer using: "
+                                    f"ANSWER: <your answer>\n\n"
+                                    f"Your answer should:\n"
+                                    f"- List all relevant games organized by date\n"
+                                    f"- Include dates, times, teams, and TV channels\n"
+                                    f"- End with a 'Sources:' section listing all URLs from the search results\n"
+                                    f"- Be comprehensive and well-organized"
+                                )
+                            else:
+                                enhanced_question = (
+                                    f"Original question: {question}\n\n"
+                                    f"Search results:\n{result}\n\n"
+                                    f"Based on the search results above, provide a comprehensive answer to the original question. "
+                                    f"Include all relevant games with dates, times, teams, and TV channels. "
+                                    f"At the end, include a 'Sources:' section with all URLs from the search results."
+                                )
+                        except Exception as e:
+                            print(f"[DEBUG] Search error: {e}")
+                            enhanced_question = (
+                                f"Original question: {question}\n\n"
+                                f"Search failed with error: {e}. Please provide an answer based on your knowledge, "
+                                f"but note that the information may not be current."
+                            )
+                else:
+                    # Couldn't extract search query, ask agent to provide answer
+                    enhanced_question = (
+                        f"Original question: {question}\n\n"
+                        f"You have search results available. Please provide your final answer now using: "
+                        f"ANSWER: <your comprehensive answer>"
+                    )
+            elif "ANSWER:" in response_text or (len(search_results) > 0 and iteration >= 2) or iteration >= max_iterations:
+                # Agent is providing final answer
+                print(f"[DEBUG] Agent providing final answer")
+                
+                # Extract answer if marked with ANSWER:
+                if "ANSWER:" in response_text:
+                    # Get everything after ANSWER:
+                    answer_parts = response_text.split("ANSWER:")
+                    if len(answer_parts) > 1:
+                        answer = answer_parts[-1].strip()
+                        # Remove any remaining ACTION or SEARCH lines
+                        lines = answer.split('\n')
+                        cleaned_lines = []
+                        for line in lines:
+                            if not line.strip().startswith("ACTION:") and not line.strip().startswith("SEARCH:"):
+                                cleaned_lines.append(line)
+                        answer = '\n'.join(cleaned_lines).strip()
+                    else:
+                        answer = response_text
+                else:
+                    # No ANSWER: marker, try to extract useful content
+                    # Remove THOUGHT and ACTION lines
+                    lines = response_text.split('\n')
+                    cleaned_lines = []
+                    skip_next = False
+                    for line in lines:
+                        if line.strip().startswith("THOUGHT:") or line.strip().startswith("ACTION:"):
+                            skip_next = True
+                            continue
+                        if skip_next and line.strip() == "":
+                            skip_next = False
+                            continue
+                        if not skip_next:
+                            cleaned_lines.append(line)
+                    answer = '\n'.join(cleaned_lines).strip()
+                    if not answer or len(answer) < 50:
+                        # Fallback: use full response
+                        answer = response_text
+                
+                # Ensure sources are included
+                if source_urls and "Sources:" not in answer and "Source URLs:" not in answer:
+                    unique_urls = list(set(source_urls))
+                    answer += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
+                elif not source_urls and search_results:
+                    # Try to extract URLs from search results
+                    import re
+                    for result in search_results:
+                        if "Source URLs:" in result:
+                            url_section = result.split("Source URLs:")[1]
+                            urls = re.findall(r'https?://[^\s\n]+', url_section)
+                            source_urls.extend(urls)
+                    if source_urls and "Sources:" not in answer:
+                        unique_urls = list(set(source_urls))
+                        answer += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
+                
+                return answer
+            else:
+                # Agent is still thinking, continue
+                enhanced_question = (
+                    f"Original question: {question}\n\n"
+                    f"Your previous response: {response_text}\n\n"
+                    f"Please decide: either use SEARCH: <query> to search for information, "
+                    f"or ANSWER: <your answer> to provide the final response."
+                )
+        
+        # Max iterations reached
+        final_response = response_text if 'response_text' in locals() else "Unable to complete request."
+        if source_urls and "Sources:" not in final_response:
+            unique_urls = list(set(source_urls))
+            final_response += f"\n\nSources:\n" + "\n".join([f"{i+1}. {url}" for i, url in enumerate(unique_urls)])
+        return final_response
+    
     return agent_call
 
 
