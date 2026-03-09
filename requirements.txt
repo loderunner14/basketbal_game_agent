@@ -1,0 +1,5 @@
+langchain>=1.2.10
+langchain-community>=0.4.1
+python-dotenv>=1.2.2
+ddgs>=9.0.0
+
